@@ -65,29 +65,10 @@ public class EndpointChecker extends AbstractProcessor {
 			for (Element annotatedElement : roundEnv.getElementsAnnotatedWith(annotation)) {
 				try {
 					switch (annotatedElement.getKind()) {
-						case METHOD: {
-							ExecutableElement method = (ExecutableElement) annotatedElement;
-							List<FoundPath> paths = findPathsFromMethod(method);
-							checkForCollisions(method, paths);
-							checkPathMatches(method, paths);
-							break;
-						}
-						case CLASS: {
-							boolean hasEndpoint = false;
-							for (Element element : annotatedElement.getEnclosedElements()) {
-								if (element.getKind() == ElementKind.METHOD && findAnnotation(element,
-										"org.springframework.web.bind.annotation.RequestMapping") != null) {
-									hasEndpoint = true;
-								}
-							}
-							if (!hasEndpoint) {
-								processingEnv.getMessager().printMessage(Kind.MANDATORY_WARNING,
-										"@" + annotation.getSimpleName() + " without endpoint",
-										annotatedElement);
-							}
-						}
-						default: {
-							// don't process unknown elements
+						case METHOD -> checkEndpointMethod(annotatedElement);
+						case CLASS -> checkControllerClass(annotation, annotatedElement);
+						default -> {
+							// don't process it
 						}
 					}
 				} catch (RuntimeException e) {
@@ -97,7 +78,12 @@ public class EndpointChecker extends AbstractProcessor {
 						processingEnv.getMessager().printMessage(Kind.ERROR, "An exception occured: \n" + sw,
 								annotatedElement);
 					} catch (IOException e1) {
-						throw new UncheckedIOException(e1);
+						processingEnv.getMessager().printMessage(Kind.ERROR,
+								"An exception occured: " + e1.getClass().getName(),
+								annotatedElement);
+						RuntimeException wrapped = new UncheckedIOException(e1);
+						wrapped.addSuppressed(e);
+						throw wrapped;
 					}
 				}
 
@@ -111,6 +97,28 @@ public class EndpointChecker extends AbstractProcessor {
 		return false;
 	}
 
+	private void checkEndpointMethod(Element annotatedElement) {
+		ExecutableElement method = (ExecutableElement) annotatedElement;
+		List<FoundPath> paths = findPathsFromMethod(method);
+		checkForCollisions(method, paths);
+		checkPathMatches(method, paths);
+	}
+
+	private void checkControllerClass(TypeElement annotation, Element annotatedElement) {
+		boolean hasEndpoint = false;
+		for (Element element : annotatedElement.getEnclosedElements()) {
+			if (element.getKind() == ElementKind.METHOD && findAnnotation(element,
+					"org.springframework.web.bind.annotation.RequestMapping") != null) {
+				hasEndpoint = true;
+			}
+		}
+		if (!hasEndpoint) {
+			processingEnv.getMessager().printMessage(Kind.MANDATORY_WARNING,
+					"@" + annotation.getSimpleName() + " without endpoint",
+					annotatedElement);
+		}
+	}
+
 	private void checkPathMatches(ExecutableElement method, List<FoundPath> paths) {
 		for (FoundPath path : paths) {
 			Matcher matcher = PATH_PARAM_PATTERN.matcher(path.path());
@@ -122,34 +130,11 @@ public class EndpointChecker extends AbstractProcessor {
 			for (VariableElement parameter : method.getParameters()) {
 				AnnotationMirror pathVariableAnnotation = findAnnotation(parameter,
 						"org.springframework.web.bind.annotation.PathVariable");
-				if (pathVariableAnnotation != null) {
-					Set<String> variableNameIdentifiers = Set.of("value", "name");
-
-					StringBuilder variableName = new StringBuilder();
-					pathVariableAnnotation.getElementValues().forEach((argName, argValue) -> {
-						if (variableNameIdentifiers.contains(argName.getSimpleName().toString())
-								&& (argValue.getValue() instanceof String s)) {
-							if (variableName.isEmpty()) {
-								variableName.append(s);
-							} else {
-								processingEnv.getMessager().printMessage(Kind.ERROR, "Duplicate name for path variable",
-										parameter);
-							}
-						}
-					});
-					String varName;
-					if (variableName.isEmpty()) {
-						varName = parameter.getSimpleName().toString();
-					} else {
-						varName = variableName.toString();
-					}
-
-					if (!expectedPathParams.remove(varName)) {
-						numOfUnnamedPathParams++;
-						processingEnv.getMessager().printMessage(Kind.WARNING,
-								"@PathVariable " + varName + " cannot be found in path " + path.path(),
-								parameter);
-					}
+				if ((pathVariableAnnotation != null)
+						&& !checkPathVariable(path, expectedPathParams,
+								parameter,
+								pathVariableAnnotation)) {
+					numOfUnnamedPathParams++;
 				}
 			}
 			if (numOfUnnamedPathParams != expectedPathParams.size()) {
@@ -157,6 +142,38 @@ public class EndpointChecker extends AbstractProcessor {
 						"@PathVariables do not match endpoint path " + path.path(), method);
 			}
 		}
+	}
+
+	private boolean checkPathVariable(FoundPath path, Set<String> expectedPathParams,
+			VariableElement parameter, AnnotationMirror pathVariableAnnotation) {
+		Set<String> variableNameIdentifiers = Set.of("value", "name");
+
+		StringBuilder variableName = new StringBuilder();
+		pathVariableAnnotation.getElementValues().forEach((argName, argValue) -> {
+			if (variableNameIdentifiers.contains(argName.getSimpleName().toString())
+					&& (argValue.getValue() instanceof String s)) {
+				if (variableName.isEmpty()) {
+					variableName.append(s);
+				} else {
+					processingEnv.getMessager().printMessage(Kind.ERROR, "Duplicate name for path variable",
+							parameter);
+				}
+			}
+		});
+		String varName;
+		if (variableName.isEmpty()) {
+			varName = parameter.getSimpleName().toString();
+		} else {
+			varName = variableName.toString();
+		}
+
+		if (!expectedPathParams.remove(varName)) {
+			processingEnv.getMessager().printMessage(Kind.WARNING,
+					"@PathVariable " + varName + " cannot be found in path " + path.path(),
+					parameter);
+			return false;
+		}
+		return true;
 	}
 
 	private Map<String, ExecutableElement> foundPaths = new HashMap<>();
@@ -172,7 +189,6 @@ public class EndpointChecker extends AbstractProcessor {
 					processingEnv.getMessager().printMessage(Kind.ERROR, "Duplicate path: " + path,
 							oldValue);
 				}
-//				processingEnv.getMessager().printMessage(Kind.OTHER, "Path: " + path, annotatedElement);
 			}
 		}
 	}
@@ -183,7 +199,7 @@ public class EndpointChecker extends AbstractProcessor {
 		if (outerElement.getKind() == ElementKind.CLASS) {
 			if (findAnnotation(outerElement, "org.springframework.stereotype.Controller") == null) {
 				processingEnv.getMessager().printMessage(Kind.MANDATORY_WARNING, "endpoint outside of controller",
-						method);// TODO move out
+						method);
 			}
 			classLevelPaths = emptyPathIfNoPaths(findPaths(outerElement));
 		} else {
@@ -286,5 +302,4 @@ public class EndpointChecker extends AbstractProcessor {
 					element);
 		}
 	}
-
 }
