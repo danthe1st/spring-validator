@@ -1,1 +1,1 @@
-io.github.danthe1st.spring_validator.processors.PathConflictChecker
+io.github.danthe1st.spring_validator.processors.EndpointChecker

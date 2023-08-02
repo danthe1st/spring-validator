@@ -13,6 +13,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.RoundEnvironment;
@@ -24,13 +26,16 @@ import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
 import javax.tools.Diagnostic.Kind;
 
 @SupportedSourceVersion(SourceVersion.RELEASE_17)
-public class PathConflictChecker extends AbstractProcessor {
+public class EndpointChecker extends AbstractProcessor {
 
 	private static final List<String> ALL_METHODS = List.of("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
 			"TRACE");
+
+	private static final Pattern PATH_PARAM_PATTERN = Pattern.compile("\\{([^{}/]+)\\}");
 
 	private static final Map<String, List<String>> ENDPOINT_ANNOTATIONS = Map.of(
 			"org.springframework.web.bind.annotation.RequestMapping", ALL_METHODS,
@@ -47,6 +52,7 @@ public class PathConflictChecker extends AbstractProcessor {
 	public Set<String> getSupportedAnnotationTypes() {
 		Set<String> supportedTypes = new HashSet<>();
 		supportedTypes.add("org.springframework.stereotype.Controller");
+		supportedTypes.add("org.springframework.web.bind.annotation.RestController");
 		for (String type : ENDPOINT_ANNOTATIONS.keySet()) {
 			supportedTypes.add(type);
 		}
@@ -60,13 +66,16 @@ public class PathConflictChecker extends AbstractProcessor {
 				try {
 					switch (annotatedElement.getKind()) {
 						case METHOD: {
-							checkForCollisions((ExecutableElement) annotatedElement);
+							ExecutableElement method = (ExecutableElement) annotatedElement;
+							List<FoundPath> paths = findPathsFromMethod(method);
+							checkForCollisions(method, paths);
+							checkPathMatches(method, paths);
 							break;
 						}
 						case CLASS: {
 							boolean hasEndpoint = false;
 							for (Element element : annotatedElement.getEnclosedElements()) {
-								if (findAnnotation(element,
+								if (element.getKind() == ElementKind.METHOD && findAnnotation(element,
 										"org.springframework.web.bind.annotation.RequestMapping") != null) {
 									hasEndpoint = true;
 								}
@@ -102,13 +111,60 @@ public class PathConflictChecker extends AbstractProcessor {
 		return false;
 	}
 
+	private void checkPathMatches(ExecutableElement method, List<FoundPath> paths) {
+		for (FoundPath path : paths) {
+			Matcher matcher = PATH_PARAM_PATTERN.matcher(path.path());
+			Set<String> expectedPathParams = new HashSet<>();
+			while (matcher.find()) {
+				expectedPathParams.add(matcher.group(1));
+			}
+			int numOfUnnamedPathParams = 0;
+			for (VariableElement parameter : method.getParameters()) {
+				AnnotationMirror pathVariableAnnotation = findAnnotation(parameter,
+						"org.springframework.web.bind.annotation.PathVariable");
+				if (pathVariableAnnotation != null) {
+					Set<String> variableNameIdentifiers = Set.of("value", "name");
+
+					StringBuilder variableName = new StringBuilder();
+					pathVariableAnnotation.getElementValues().forEach((argName, argValue) -> {
+						if (variableNameIdentifiers.contains(argName.getSimpleName().toString())
+								&& (argValue.getValue() instanceof String s)) {
+							if (variableName.isEmpty()) {
+								variableName.append(s);
+							} else {
+								processingEnv.getMessager().printMessage(Kind.ERROR, "Duplicate name for path variable",
+										parameter);
+							}
+						}
+					});
+					String varName;
+					if (variableName.isEmpty()) {
+						varName = parameter.getSimpleName().toString();
+					} else {
+						varName = variableName.toString();
+					}
+
+					if (!expectedPathParams.remove(varName)) {
+						numOfUnnamedPathParams++;
+						processingEnv.getMessager().printMessage(Kind.WARNING,
+								"@PathVariable " + varName + " cannot be found in path " + path.path(),
+								parameter);
+					}
+				}
+			}
+			if (numOfUnnamedPathParams != expectedPathParams.size()) {
+				processingEnv.getMessager().printMessage(Kind.ERROR,
+						"@PathVariables do not match endpoint path " + path.path(), method);
+			}
+		}
+	}
+
 	private Map<String, ExecutableElement> foundPaths = new HashMap<>();
 
-	private void checkForCollisions(ExecutableElement annotatedElement) {
-		List<FoundPath> paths = findPathsFromMethod(annotatedElement);
+	private void checkForCollisions(ExecutableElement annotatedElement, List<FoundPath> paths) {
 		for (FoundPath foundPath : paths) {
 			for (String method : foundPath.methods()) {
-				String path = method + " " + foundPath.path();
+				String path = method + " " + PATH_PARAM_PATTERN.matcher(foundPath.path()).replaceAll("*");
 				ExecutableElement oldValue = foundPaths.putIfAbsent(path, annotatedElement);
 				if (oldValue != null && oldValue != annotatedElement) {
 					processingEnv.getMessager().printMessage(Kind.ERROR, "Duplicate path: " + path,
@@ -121,21 +177,20 @@ public class PathConflictChecker extends AbstractProcessor {
 		}
 	}
 
-	private List<FoundPath> findPathsFromMethod(ExecutableElement annotatedElement) {
-		Element outerElement = annotatedElement.getEnclosingElement();
+	private List<FoundPath> findPathsFromMethod(ExecutableElement method) {
+		Element outerElement = method.getEnclosingElement();
 		List<FoundPath> classLevelPaths;
 		if (outerElement.getKind() == ElementKind.CLASS) {
-			classLevelPaths = findPaths(outerElement);
 			if (findAnnotation(outerElement, "org.springframework.stereotype.Controller") == null) {
 				processingEnv.getMessager().printMessage(Kind.MANDATORY_WARNING, "endpoint outside of controller",
-						annotatedElement);
+						method);// TODO move out
 			}
-			classLevelPaths = emptyPathIfNoPaths(classLevelPaths);
+			classLevelPaths = emptyPathIfNoPaths(findPaths(outerElement));
 		} else {
-			processingEnv.getMessager().printMessage(Kind.ERROR, "expected to be enclosed in class", annotatedElement);
+			processingEnv.getMessager().printMessage(Kind.ERROR, "expected to be enclosed in class", method);
 			return Collections.emptyList();
 		}
-		List<FoundPath> methodPaths = emptyPathIfNoPaths(findPaths(annotatedElement));
+		List<FoundPath> methodPaths = emptyPathIfNoPaths(findPaths(method));
 
 		List<FoundPath> ret = new ArrayList<>();
 		for (FoundPath classLevelPath : classLevelPaths) {
@@ -144,7 +199,6 @@ public class PathConflictChecker extends AbstractProcessor {
 				if (!path.startsWith("/")) {
 					path = "/" + path;
 				}
-				path = path.replaceAll("\\{[^{}/]+\\}", "*");
 				ret.add(new FoundPath(path, methodLevelPath.methods()));
 			}
 		}
